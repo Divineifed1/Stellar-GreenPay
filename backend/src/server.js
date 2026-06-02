@@ -56,6 +56,11 @@ app.use(cors({
 const origins = getAllowedOrigins();
 app.use(...createCorsMiddleware(origins));
 
+app.get("/metrics", async (req, res) => {
+  res.set("Content-Type", require("prom-client").register.contentType);
+  res.end(await require("prom-client").register.metrics());
+});
+
 const io = new Server(server, {
   cors: {
     origin: origins,

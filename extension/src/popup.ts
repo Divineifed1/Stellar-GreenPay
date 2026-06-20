@@ -58,6 +58,170 @@ async function submitTransaction(signedXdr: string): Promise<string> {
   return (result as any).hash;
 }
 
+// --- Project search autocomplete ---
+
+const API_BASE = 'https://api.stellar-greenpay.app';
+
+interface ProjectResult {
+  id: string;
+  name: string;
+  category: string;
+  walletAddress?: string;
+}
+
+let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let activeDropdownIndex = -1;
+let dropdownItems: HTMLLIElement[] = [];
+let selectedProjectId: string | null = null;
+
+function debounce(fn: () => void, ms: number) {
+  if (searchDebounceTimer !== null) clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(fn, ms);
+}
+
+function renderDropdown(projects: ProjectResult[], dropdown: HTMLUListElement) {
+  dropdown.innerHTML = '';
+  dropdownItems = [];
+  activeDropdownIndex = -1;
+
+  if (projects.length === 0) {
+    const empty = document.createElement('li');
+    empty.className = 'search-no-results';
+    empty.textContent = 'No projects found';
+    dropdown.appendChild(empty);
+    dropdown.classList.remove('hidden');
+    return;
+  }
+
+  projects.forEach((p) => {
+    const li = document.createElement('li');
+    li.innerHTML = `
+      <div>
+        <div class="search-result-name">${escapeHtml(p.name)}</div>
+        <div class="search-result-cat">${escapeHtml(p.category)}</div>
+      </div>
+    `;
+    li.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      const destInput = document.getElementById('destination') as HTMLInputElement | null;
+      const searchInput = document.getElementById('project-search') as HTMLInputElement | null;
+      if (p.walletAddress && destInput) {
+        destInput.value = p.walletAddress;
+        selectedProjectId = p.id;
+      }
+      if (searchInput) {
+        searchInput.value = p.name;
+      }
+      dropdown.classList.add('hidden');
+    });
+    dropdown.appendChild(li);
+    dropdownItems.push(li);
+  });
+
+  dropdown.classList.remove('hidden');
+}
+
+function highlightDropdownItem(index: number) {
+  dropdownItems.forEach((el, i) => {
+    el.classList.toggle('active', i === index);
+  });
+}
+
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+async function fetchProjectSearch(query: string): Promise<ProjectResult[]> {
+  const res = await fetch(`${API_BASE}/api/projects?search=${encodeURIComponent(query)}&limit=5`);
+  if (!res.ok) throw new Error('Search failed');
+  const json = await res.json();
+  return (json.data ?? json) as ProjectResult[];
+}
+
+function initProjectSearch() {
+  const input = document.getElementById('project-search') as HTMLInputElement | null;
+  const dropdown = document.getElementById('search-dropdown') as HTMLUListElement | null;
+  const wrapper = document.getElementById('search-wrapper');
+
+  if (!input || !dropdown || !wrapper) return;
+
+  input.addEventListener('input', () => {
+    const q = input.value.trim();
+    selectedProjectId = null; // user is typing a new search, clear prior selection
+    if (q.length < 2) {
+      dropdown.classList.add('hidden');
+      return;
+    }
+    debounce(async () => {
+      try {
+        const results = await fetchProjectSearch(q);
+        renderDropdown(results, dropdown);
+      } catch {
+        dropdown.classList.add('hidden');
+      }
+    }, 300);
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (dropdown.classList.contains('hidden')) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeDropdownIndex = Math.min(activeDropdownIndex + 1, dropdownItems.length - 1);
+      highlightDropdownItem(activeDropdownIndex);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeDropdownIndex = Math.max(activeDropdownIndex - 1, 0);
+      highlightDropdownItem(activeDropdownIndex);
+    } else if (e.key === 'Enter' && activeDropdownIndex >= 0) {
+      dropdownItems[activeDropdownIndex]?.dispatchEvent(new MouseEvent('mousedown'));
+    } else if (e.key === 'Escape') {
+      dropdown.classList.add('hidden');
+    }
+  });
+
+  input.addEventListener('blur', () => {
+    setTimeout(() => dropdown.classList.add('hidden'), 150);
+  });
+}
+
+// --- Record donation on backend with exponential-backoff retry ---
+
+async function recordDonation(params: {
+  projectId: string;
+  donorAddress: string;
+  amountXLM: string;
+  currency: string;
+  transactionHash: string;
+  message?: string;
+}): Promise<void> {
+  // 4 attempts with increasing delays: immediate, 500 ms, 1 000 ms, 2 000 ms
+  const delays = [0, 500, 1000, 2000];
+  let lastError: Error | null = null;
+
+  for (let i = 0; i < delays.length; i++) {
+    if (i > 0) await new Promise<void>((r) => setTimeout(r, delays[i]));
+    try {
+      const res = await fetch(`${API_BASE}/api/donations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      });
+      if (res.ok) return;
+      // 4xx = client error (bad data); retrying won't help
+      if (res.status >= 400 && res.status < 500) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      lastError = new Error(`HTTP ${res.status}`);
+    } catch (err: any) {
+      // Re-throw immediately on client errors
+      if (err.message?.startsWith('HTTP 4')) throw err;
+      lastError = err;
+    }
+  }
+
+  throw lastError ?? new Error('Failed to record donation after retries');
+}
+
 // --- UI wiring ---
 
 function setStatus(message: string, isError = false) {
@@ -76,6 +240,8 @@ function setLoading(loading: boolean) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  initProjectSearch();
+
   const form = document.getElementById('donation-form');
   if (!form) return;
 
@@ -108,7 +274,29 @@ document.addEventListener('DOMContentLoaded', () => {
       setStatus('Submitting to Horizon testnet…');
       const txHash = await submitTransaction(signedXdr);
 
-      setStatus(`Donation successful! TX: ${txHash.slice(0, 12)}…`);
+      // Capture and reset before the async recording call to prevent double-submit
+      const capturedProjectId = selectedProjectId;
+      selectedProjectId = null;
+
+      if (capturedProjectId) {
+        setStatus('Recording donation…');
+        try {
+          await recordDonation({
+            projectId: capturedProjectId,
+            donorAddress: sourceAddress,
+            amountXLM: amount,
+            currency: 'XLM',
+            transactionHash: txHash,
+            message: memo || undefined,
+          });
+          setStatus(`Donation successful! TX: ${txHash.slice(0, 12)}… (recorded)`);
+        } catch {
+          // The Stellar tx succeeded — don't fail the UX because recording failed
+          setStatus(`Donation successful! TX: ${txHash.slice(0, 12)}… (record failed, tx succeeded)`);
+        }
+      } else {
+        setStatus(`Donation successful! TX: ${txHash.slice(0, 12)}…`);
+      }
     } catch (err: any) {
       const detail =
         err?.response?.data?.extras?.result_codes?.transaction ??

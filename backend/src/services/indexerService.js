@@ -5,8 +5,7 @@
 
 const { server: stellarServer } = require("./stellar");
 const pool = require("../db/pool");
-const { v4: uuid } = require("uuid");
-const { computeBadges } = require("./store");
+const { recordDonationCommand } = require("./accounting/commands");
 
 let lastProcessedLedger = 0;
 let lastReconciledLedger = 0;
@@ -57,11 +56,6 @@ async function reconcileDonations() {
 
       for (const payment of payments.records) {
         if (payment.asset_type !== "native") continue;
-        const result = await client.query(
-          "SELECT id FROM donations WHERE transaction_hash = $1",
-          [payment.transaction_hash]
-        );
-        if (result.rows.length > 0) continue;
 
         const txHash = payment.transaction_hash;
         const donorAddress = payment.from;
@@ -69,22 +63,18 @@ async function reconcileDonations() {
 
         try {
           await client.query("BEGIN");
-          const donationId = uuid();
-          await client.query(
-            `INSERT INTO donations (id, project_id, donor_address, amount_xlm, amount, currency, transaction_hash, created_at)
-             VALUES ($1, $2, $3, $4, $5, 'XLM', $6, NOW())`,
-            [donationId, projectId, donorAddress, amountXLM, amountXLM, txHash]
-          );
-          await client.query(
-            `UPDATE projects
-             SET raised_xlm = raised_xlm + $1,
-                 donor_count = (SELECT COUNT(DISTINCT donor_address) FROM donations WHERE project_id = $2),
-                 updated_at = NOW()
-             WHERE id = $2`,
-            [amountXLM, projectId]
-          );
+          const commandResult = await recordDonationCommand(client, {
+            projectId,
+            donorAddress,
+            amountXLM: amountXLM.toFixed(7),
+            transactionHash: txHash,
+            source: "indexer-reconcile",
+          });
           await client.query("COMMIT");
-          console.log(`[Reconciler] Found missing donation: ${amountXLM} XLM to project ${projectId}`);
+
+          if (!commandResult.duplicate) {
+            console.log(`[Reconciler] Found missing donation: ${amountXLM} XLM to project ${projectId}`);
+          }
         } catch (e) {
           await client.query("ROLLBACK");
           console.error("[Reconciler] Failed to record donation:", e.message);
@@ -155,70 +145,23 @@ async function handleDonation(projectId, op) {
   let inTransaction = false;
 
   try {
-    // 1. Deduplicate by transaction hash
-    const existingResult = await client.query(
-      "SELECT id FROM donations WHERE transaction_hash = $1",
-      [txHash]
-    );
-    if (existingResult.rows.length > 0) {
-      return;
-    }
-
     await client.query("BEGIN");
     inTransaction = true;
 
-    // 2. Record the donation
-    const donationId = uuid();
-    await client.query(
-      `INSERT INTO donations (id, project_id, donor_address, amount_xlm, amount, currency, transaction_hash, created_at)
-       VALUES ($1, $2, $3, $4, $5, 'XLM', $6, NOW())`,
-      [donationId, projectId, donorAddress, amountXLM, amountXLM, txHash]
-    );
-
-    // 3. Update project raised amount and donor count
-    await client.query(
-      `UPDATE projects
-       SET raised_xlm = raised_xlm + $1,
-           donor_count = (SELECT COUNT(DISTINCT donor_address) FROM donations WHERE project_id = $2),
-           updated_at = NOW()
-       WHERE id = $2`,
-      [amountXLM, projectId]
-    );
-
-    // 4. Update donor profile (total donated, projects supported, badges)
-    const existingProfileResult = await client.query(
-      "SELECT total_donated_xlm FROM profiles WHERE public_key = $1",
-      [donorAddress]
-    );
-    const existingProfile = existingProfileResult.rows[0];
-    const previousTotal = existingProfile ? parseFloat(existingProfile.total_donated_xlm || "0") : 0;
-    const newTotal = previousTotal + amountXLM;
-    
-    const projectsSupportedResult = await client.query(
-      "SELECT COUNT(DISTINCT project_id) AS count FROM donations WHERE donor_address = $1",
-      [donorAddress]
-    );
-    const projectsSupported = parseInt(projectsSupportedResult.rows[0].count, 10) || 1;
-    const badges = computeBadges(newTotal);
-
-    await client.query(
-      `INSERT INTO profiles (public_key, total_donated_xlm, projects_supported, badges, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, NOW(), NOW())
-       ON CONFLICT (public_key) DO UPDATE SET
-         total_donated_xlm = EXCLUDED.total_donated_xlm,
-         projects_supported = EXCLUDED.projects_supported,
-         badges = EXCLUDED.badges,
-         updated_at = NOW()`,
-      [donorAddress, newTotal.toFixed(7), projectsSupported, JSON.stringify(badges)]
-    );
+    const commandResult = await recordDonationCommand(client, {
+      projectId,
+      donorAddress,
+      amountXLM: amountXLM.toFixed(7),
+      transactionHash: txHash,
+      source: "indexer-stream",
+    });
 
     await client.query("COMMIT");
     inTransaction = false;
 
     console.log(`[Indexer] New donation: ${amountXLM} XLM from ${donorAddress} to project ${projectId}`);
 
-    // 5. Emit WebSocket event
-    if (io) {
+    if (io && !commandResult.duplicate) {
       io.emit("newDonation", {
         projectId,
         donorAddress,

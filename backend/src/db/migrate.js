@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const pool = require("./pool");
 const { seedProjects, seedProjectUpdates, seedJobs } = require("../services/store");
+const { backfillAccountBalances, backfillLegacyDonationEvents } = require("../services/accounting/legacyMigration");
 
 async function runMigrations() {
   const client = await pool.connect();
@@ -78,8 +79,11 @@ async function runMigrations() {
       );
     }
 
+    const legacyDonationEvents = await backfillLegacyDonationEvents(client);
+    await backfillAccountBalances(client);
+
     await client.query("COMMIT");
-    console.log("[DB] Migration and seeding complete");
+    console.log(`[DB] Migration and seeding complete; backfilled ${legacyDonationEvents} legacy donation events`);
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;

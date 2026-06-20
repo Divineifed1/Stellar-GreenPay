@@ -24,15 +24,81 @@ function queryResult(rows = []) {
   return { rows };
 }
 
-function createMockClient(...responses) {
-  const client = { query: jest.fn(), release: jest.fn() };
-  responses.forEach((r) => {
-    if (r instanceof Error) {
-      client.query.mockRejectedValueOnce(r);
-    } else {
-      client.query.mockResolvedValueOnce(r);
-    }
-  });
+function createMockClient({ donationRow, existingEvent } = {}) {
+  let sequence = 1;
+  const client = {
+    query: jest.fn(async (sql) => {
+      if (sql.includes("SELECT id FROM projects")) {
+        return queryResult([{ id: "project-ws" }]);
+      }
+
+      if (sql.includes("payload->>'transactionHash'")) {
+        return existingEvent ? queryResult([existingEvent]) : queryResult([]);
+      }
+
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+        return queryResult();
+      }
+
+      if (sql.includes("SELECT COALESCE(MAX(aggregate_version)")) {
+        return queryResult([{ version: "0" }]);
+      }
+
+      if (sql.includes("INSERT INTO ledger_events")) {
+        return queryResult([{ sequence: String(sequence++) }]);
+      }
+
+      if (sql.includes("SELECT 1") && sql.includes("ledger_projection_events")) {
+        return queryResult([]);
+      }
+
+      if (sql.includes("INSERT INTO donations")) {
+        return queryResult([donationRow || {
+          id: "socket-donation-1",
+          project_id: "project-ws",
+          donor_address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMB",
+          amount_xlm: "25",
+          amount: "25",
+          currency: "XLM",
+          message: null,
+          transaction_hash: makeTxHash("a"),
+          created_at: new Date().toISOString(),
+        }]);
+      }
+
+      if (sql.includes("UPDATE projects")) {
+        return queryResult();
+      }
+
+      if (sql.includes("SELECT public_key, display_name, bio")) {
+        return queryResult([]);
+      }
+
+      if (sql.includes("SELECT COUNT(DISTINCT project_id) AS count")) {
+        return queryResult([{ count: "1" }]);
+      }
+
+      if (sql.includes("INSERT INTO profiles")) {
+        return queryResult();
+      }
+
+      if (sql.includes("INSERT INTO account_balances")) {
+        return queryResult();
+      }
+
+      if (sql.includes("INSERT INTO ledger_projection_events")) {
+        return queryResult();
+      }
+
+      if (sql.includes("SELECT id, matcher_address")) {
+        return queryResult([]);
+      }
+
+      return queryResult();
+    }),
+    release: jest.fn(),
+  };
+
   pool.connect.mockResolvedValue(client);
   return client;
 }
@@ -87,17 +153,7 @@ describe("POST /api/donations → donation_event WebSocket broadcast", () => {
         created_at: new Date().toISOString(),
       };
 
-      createMockClient(
-        queryResult([{ id: "project-ws" }]),   // SELECT project
-        queryResult([]),                          // dedup check
-        queryResult(),                            // BEGIN
-        queryResult([donationRow]),               // INSERT donation
-        queryResult([]),                          // SELECT donation_matches (empty)
-        queryResult(),                            // UPDATE projects
-        queryResult([]),                          // SELECT * FROM profiles (new donor)
-        queryResult([{ count: "1" }]),            // SELECT COUNT(DISTINCT project_id)
-        queryResult(),                            // INSERT INTO profiles
-      );
+      createMockClient({ donationRow });
 
       const socket = ioc(baseUrl, {
         transports: ["websocket"],
@@ -154,10 +210,8 @@ describe("POST /api/donations → donation_event WebSocket broadcast", () => {
     (done) => {
       const donorAddress = makePublicKey("X");
       const transactionHash = makeTxHash("8");
-
-      createMockClient(
-        queryResult([]),  // SELECT project → empty (not found)
-      );
+      const client = createMockClient();
+      client.query.mockImplementationOnce(async () => queryResult([]));
 
       const socket = ioc(baseUrl, {
         transports: ["websocket"],
@@ -214,17 +268,7 @@ describe("POST /api/donations → donation_event WebSocket broadcast", () => {
         created_at: new Date().toISOString(),
       };
 
-      createMockClient(
-        queryResult([{ id: "project-ws-2" }]),
-        queryResult([]),
-        queryResult(),
-        queryResult([donationRow]),
-        queryResult([]),
-        queryResult(),
-        queryResult([]),
-        queryResult([{ count: "1" }]),
-        queryResult(),
-      );
+      createMockClient({ donationRow });
 
       const socket = ioc(baseUrl, {
         transports: ["websocket"],
@@ -241,7 +285,7 @@ describe("POST /api/donations → donation_event WebSocket broadcast", () => {
           clearTimeout(deadline);
           socket.disconnect();
           try {
-            expect(data.amountXLM).toBe("100");
+            expect(data.amountXLM).toBe("100.0000000");
             done();
           } catch (assertionError) {
             done(assertionError);

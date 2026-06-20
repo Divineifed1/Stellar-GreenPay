@@ -39,6 +39,44 @@ CREATE TABLE IF NOT EXISTS donations (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS ledger_events (
+  id UUID PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  aggregate_type TEXT NOT NULL,
+  aggregate_id UUID NOT NULL,
+  aggregate_version INTEGER NOT NULL,
+  sequence BIGSERIAL UNIQUE NOT NULL,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  payload JSONB NOT NULL,
+  metadata JSONB NOT NULL DEFAULT '{}'::JSONB
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ledger_events_transaction_hash_idx
+  ON ledger_events ((payload->>'transactionHash'));
+
+CREATE UNIQUE INDEX IF NOT EXISTS ledger_events_aggregate_version_idx
+  ON ledger_events (aggregate_type, aggregate_id, aggregate_version);
+
+CREATE TABLE IF NOT EXISTS ledger_projection_events (
+  projection_name TEXT NOT NULL,
+  event_sequence BIGINT NOT NULL,
+  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (projection_name, event_sequence)
+);
+
+CREATE TABLE IF NOT EXISTS account_balances (
+  account_type TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  currency TEXT NOT NULL DEFAULT 'XLM',
+  balance NUMERIC(20, 7) NOT NULL DEFAULT 0,
+  total_donated_xlm NUMERIC(20, 7) NOT NULL DEFAULT 0,
+  projects_supported INTEGER NOT NULL DEFAULT 0,
+  donation_count INTEGER NOT NULL DEFAULT 0,
+  last_event_sequence BIGINT NOT NULL DEFAULT 0,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (account_type, account_id, currency)
+);
+
 CREATE TABLE IF NOT EXISTS profiles (
   public_key TEXT PRIMARY KEY,
   display_name TEXT,

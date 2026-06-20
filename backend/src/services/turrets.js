@@ -10,6 +10,7 @@
 
 const { Server, TransactionBuilder, Networks, Operation, Asset, Horizon } = require("@stellar/stellar-sdk");
 const pool = require("../db/pool");
+const { recordMatchingDonationCommand } = require("./accounting/commands");
 
 // Network configuration
 const NETWORK = process.env.STELLAR_NETWORK || "testnet";
@@ -28,6 +29,8 @@ function getServer() {
  * This function is called by the Turret when a payment is detected
  */
 async function matchDonationTxFunction(payment) {
+  let client;
+
   try {
     const { 
       transaction_hash, 
@@ -39,14 +42,14 @@ async function matchDonationTxFunction(payment) {
       memo 
     } = payment;
 
-    // Only match XLM donations
     if (asset_type !== "native" && asset_code !== "XLM") {
       console.log(`Skipping non-XLM donation: ${asset_code || asset_type}`);
       return { matched: false, reason: "Not an XLM donation" };
     }
 
-    // Find the project by wallet address
-    const projectResult = await pool.query(
+    client = await pool.connect();
+
+    const projectResult = await client.query(
       "SELECT id, name FROM projects WHERE wallet_address = $1",
       [to]
     );
@@ -59,8 +62,7 @@ async function matchDonationTxFunction(payment) {
     const project = projectResult.rows[0];
     const donationAmount = parseFloat(amount);
 
-    // Check for active matching offers
-    const matchesResult = await pool.query(
+    const matchesResult = await client.query(
       `SELECT id, matcher_address, cap_xlm, matched_xlm, multiplier
        FROM donation_matches
        WHERE project_id = $1 AND expires_at > NOW()
@@ -73,7 +75,6 @@ async function matchDonationTxFunction(payment) {
       return { matched: false, reason: "No active matching offers" };
     }
 
-    // Process matching offers
     let totalMatched = 0;
     const matchResults = [];
 
@@ -88,7 +89,6 @@ async function matchDonationTxFunction(payment) {
 
       if (matchAmount <= 0) continue;
 
-      // Build and submit the matching payment transaction
       const matchResult = await submitMatchingPayment({
         matcherAddress: match.matcher_address,
         projectWallet: to,
@@ -99,40 +99,46 @@ async function matchDonationTxFunction(payment) {
       });
 
       if (matchResult.success) {
-        // Update the matched amount in the database
-        await pool.query(
-          `UPDATE donation_matches 
-           SET matched_xlm = matched_xlm + $1 
-           WHERE id = $2`,
-          [matchAmount, match.id]
-        );
+        let dbClient;
+        let inTransaction = false;
 
-        // Record the matched donation
-        await pool.query(
-          `INSERT INTO donations (
-            id, project_id, donor_address, amount_xlm, amount, currency, 
-            message, transaction_hash, created_at
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())`,
-          [
-            require("uuid").v4(),
-            project.id,
-            match.matcher_address,
-            matchAmount,
-            matchAmount,
-            "XLM",
-            `Matching donation for ${from}`,
-            matchResult.txHash
-          ]
-        );
+        try {
+          dbClient = await pool.connect();
+          await dbClient.query("BEGIN");
+          inTransaction = true;
 
-        totalMatched += matchAmount;
-        matchResults.push({
-          matchId: match.id,
-          matcherAddress: match.matcher_address,
-          amount: matchAmount,
-          txHash: matchResult.txHash
-        });
+          const commandResult = await recordMatchingDonationCommand(dbClient, {
+            projectId: project.id,
+            matcherAddress: match.matcher_address,
+            amountXLM: matchAmount.toFixed(7),
+            originalTransactionHash: transaction_hash,
+            originalDonorAddress: from,
+            matchId: match.id,
+            transactionHash: matchResult.txHash,
+            message: `Matching donation for ${from}`,
+            source: "turrets",
+            metadata: { memo }
+          });
+
+          await dbClient.query("COMMIT");
+          inTransaction = false;
+
+          if (!commandResult.duplicate) {
+            totalMatched += matchAmount;
+          }
+
+          matchResults.push({
+            matchId: match.id,
+            matcherAddress: match.matcher_address,
+            amount: matchAmount,
+            txHash: matchResult.txHash
+          });
+        } catch (error) {
+          if (inTransaction && dbClient) await dbClient.query("ROLLBACK");
+          console.error("Error recording matched donation:", error);
+        } finally {
+          if (dbClient) dbClient.release();
+        }
       }
     }
 
@@ -147,6 +153,8 @@ async function matchDonationTxFunction(payment) {
   } catch (error) {
     console.error("Error in matchDonationTxFunction:", error);
     return { matched: false, error: error.message };
+  } finally {
+    if (client) client.release();
   }
 }
 

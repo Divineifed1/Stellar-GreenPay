@@ -24,20 +24,116 @@ function queryResult(rows = []) {
   return { rows };
 }
 
-function createMockClient(...responses) {
+function eventRow({ transactionHash, donationId = "donation-event-1", donorAddress, amountXLM = "10" }) {
+  return {
+    id: "event-1",
+    event_type: "DonationRecorded",
+    aggregate_type: "donation",
+    aggregate_id: donationId,
+    aggregate_version: "1",
+    sequence: "1",
+    occurred_at: "2026-03-29T10:00:00.000Z",
+    payload: {
+      donationId,
+      projectId: "project-1",
+      donorAddress,
+      amountXLM,
+      amount: amountXLM,
+      currency: "XLM",
+      message: null,
+      transactionHash,
+      createdAt: "2026-03-29T10:00:00.000Z",
+      source: "test",
+    },
+    metadata: {},
+  };
+}
+
+function createMockClient({
+  donationRow,
+  existingEvent,
+  existingProfile,
+  matches = [],
+  projectsSupportedCount = "1",
+  throwOnSql,
+} = {}) {
+  let sequence = 1;
   const client = {
-    query: jest.fn(),
+    query: jest.fn(async (sql) => {
+      if (throwOnSql && sql.includes(throwOnSql)) {
+        throw new Error("profile write failed");
+      }
+
+      if (sql.includes("SELECT id FROM projects")) {
+        return queryResult([{ id: "project-1" }]);
+      }
+
+      if (sql.includes("payload->>'transactionHash'")) {
+        return existingEvent ? queryResult([existingEvent]) : queryResult([]);
+      }
+
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+        return queryResult();
+      }
+
+      if (sql.includes("SELECT COALESCE(MAX(aggregate_version)")) {
+        return queryResult([{ version: "0" }]);
+      }
+
+      if (sql.includes("INSERT INTO ledger_events")) {
+        return queryResult([{ sequence: String(sequence++) }]);
+      }
+
+      if (sql.includes("SELECT 1") && sql.includes("ledger_projection_events")) {
+        return queryResult([]);
+      }
+
+      if (sql.includes("INSERT INTO donations")) {
+        return queryResult([donationRow || {
+          id: "donation-1",
+          project_id: "project-1",
+          donor_address: "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMB",
+          amount_xlm: "10",
+          amount: "10",
+          currency: "XLM",
+          message: null,
+          transaction_hash: makeTxHash("a"),
+          created_at: "2026-03-29T10:00:00.000Z",
+        }]);
+      }
+
+      if (sql.includes("UPDATE projects")) {
+        return queryResult();
+      }
+
+      if (sql.includes("SELECT public_key, display_name, bio")) {
+        return existingProfile ? queryResult([existingProfile]) : queryResult([]);
+      }
+
+      if (sql.includes("SELECT COUNT(DISTINCT project_id) AS count")) {
+        return queryResult([{ count: projectsSupportedCount }]);
+      }
+
+      if (sql.includes("INSERT INTO profiles")) {
+        return queryResult();
+      }
+
+      if (sql.includes("INSERT INTO account_balances")) {
+        return queryResult();
+      }
+
+      if (sql.includes("INSERT INTO ledger_projection_events")) {
+        return queryResult();
+      }
+
+      if (sql.includes("SELECT id, matcher_address")) {
+        return queryResult(matches);
+      }
+
+      return queryResult();
+    }),
     release: jest.fn(),
   };
-
-  responses.forEach((response) => {
-    if (response instanceof Error) {
-      client.query.mockRejectedValueOnce(response);
-      return;
-    }
-
-    client.query.mockResolvedValueOnce(response);
-  });
 
   pool.connect.mockResolvedValue(client);
   return client;
@@ -141,29 +237,7 @@ describe("POST /api/donations", () => {
   test("records a valid donation and updates the donor profile", async () => {
     const donorAddress = makePublicKey("A");
     const transactionHash = makeTxHash("a");
-    const donationRow = {
-      id: "donation-1",
-      project_id: "project-1",
-      donor_address: donorAddress,
-      amount_xlm: "10",
-      amount: "10",
-      currency: "XLM",
-      message: null,
-      transaction_hash: transactionHash,
-      created_at: "2026-03-29T10:00:00.000Z",
-    };
-
-    const client = createMockClient(
-      queryResult([{ id: "project-1" }]),   // SELECT project
-      queryResult([]),                         // dedup check
-      queryResult(),                           // BEGIN
-      queryResult([donationRow]),              // INSERT donation
-      queryResult([]),                         // SELECT donation_matches (empty)
-      queryResult(),                           // UPDATE projects
-      queryResult([]),                         // SELECT * FROM profiles (new donor)
-      queryResult([{ count: "1" }]),           // SELECT COUNT(DISTINCT project_id)
-      queryResult(),                           // INSERT INTO profiles
-    );
+    const client = createMockClient();
 
     const { res, next } = await invokeRecordDonation({
       projectId: "project-1",
@@ -198,7 +272,8 @@ describe("POST /api/donations", () => {
   });
 
   test("returns 404 for an unknown project id", async () => {
-    const client = createMockClient(queryResult([]));
+    const client = createMockClient({ donationRow: null });
+    client.query.mockImplementationOnce(async () => queryResult([]));
 
     const { res, next } = await invokeRecordDonation({
       projectId: "missing-project",
@@ -244,21 +319,13 @@ describe("POST /api/donations", () => {
   test("deduplicates duplicate transaction hashes and returns the existing record", async () => {
     const donorAddress = makePublicKey("D");
     const transactionHash = makeTxHash("d");
-    const existingDonation = {
-      id: "donation-existing",
-      project_id: "project-1",
-      donor_address: donorAddress,
-      amount_xlm: "25",
-      amount: "25",
-      currency: "XLM",
-      message: null,
-      transaction_hash: transactionHash,
-      created_at: "2026-03-29T10:00:00.000Z",
-    };
-    const client = createMockClient(
-      queryResult([{ id: "project-1" }]),
-      queryResult([existingDonation]),
-    );
+    const existingEvent = eventRow({
+      transactionHash,
+      donationId: "donation-existing",
+      donorAddress,
+      amountXLM: "25",
+    });
+    const client = createMockClient({ existingEvent });
 
     const { res, next } = await invokeRecordDonation({
       projectId: "project-1",
@@ -281,27 +348,7 @@ describe("POST /api/donations", () => {
   });
 
   test("updates project totals after a donation", async () => {
-    const client = createMockClient(
-      queryResult([{ id: "project-2" }]),    // SELECT project
-      queryResult([]),                          // dedup check
-      queryResult(),                            // BEGIN
-      queryResult([{
-        id: "donation-2",
-        project_id: "project-2",
-        donor_address: makePublicKey("E"),
-        amount_xlm: "5.5",
-        amount: "5.5",
-        currency: "XLM",
-        message: null,
-        transaction_hash: makeTxHash("e"),
-        created_at: "2026-03-29T10:00:00.000Z",
-      }]),                                      // INSERT donation
-      queryResult([]),                          // SELECT donation_matches (empty)
-      queryResult(),                            // UPDATE projects
-      queryResult([]),                          // SELECT * FROM profiles (new donor)
-      queryResult([{ count: "1" }]),            // SELECT COUNT(DISTINCT project_id)
-      queryResult(),                            // INSERT INTO profiles
-    );
+    const client = createMockClient();
 
     const { res, next } = await invokeRecordDonation({
       projectId: "project-2",
@@ -319,32 +366,15 @@ describe("POST /api/donations", () => {
 
   test("calculates badges from cumulative donations across multiple requests", async () => {
     const donorAddress = makePublicKey("F");
-    const client = createMockClient(
-      queryResult([{ id: "project-3" }]),    // SELECT project
-      queryResult([]),                          // dedup check
-      queryResult(),                            // BEGIN
-      queryResult([{
-        id: "donation-3",
-        project_id: "project-3",
-        donor_address: donorAddress,
-        amount_xlm: "1",
-        amount: "1",
-        currency: "XLM",
-        message: null,
-        transaction_hash: makeTxHash("f"),
-        created_at: "2026-03-29T10:00:00.000Z",
-      }]),                                      // INSERT donation
-      queryResult([]),                          // SELECT donation_matches (empty)
-      queryResult(),                            // UPDATE projects
-      queryResult([{                            // SELECT * FROM profiles (returning existing)
+    const client = createMockClient({
+      existingProfile: {
         public_key: donorAddress,
         display_name: "Existing Donor",
         bio: "Already donated before",
         total_donated_xlm: "99.0000000",
-      }]),
-      queryResult([{ count: "3" }]),            // SELECT COUNT(DISTINCT project_id)
-      queryResult(),                            // INSERT INTO profiles
-    );
+      },
+      projectsSupportedCount: "3",
+    });
 
     const { res, next } = await invokeRecordDonation({
       projectId: "project-3",
@@ -365,27 +395,7 @@ describe("POST /api/donations", () => {
   });
 
   test("rolls back the transaction if profile persistence fails after BEGIN", async () => {
-    const client = createMockClient(
-      queryResult([{ id: "project-4" }]),
-      queryResult([]),
-      queryResult(),
-      queryResult([{
-        id: "donation-4",
-        project_id: "project-4",
-        donor_address: makePublicKey("G"),
-        amount_xlm: "12",
-        amount: "12",
-        currency: "XLM",
-        message: null,
-        transaction_hash: makeTxHash("a"),
-        created_at: "2026-03-29T10:00:00.000Z",
-      }]),
-      queryResult(),
-      queryResult([]),
-      queryResult([{ count: "1" }]),
-      new Error("profile write failed"),
-      queryResult(),
-    );
+    const client = createMockClient({ throwOnSql: "INSERT INTO profiles" });
 
     const { res, next } = await invokeRecordDonation({
       projectId: "project-4",
